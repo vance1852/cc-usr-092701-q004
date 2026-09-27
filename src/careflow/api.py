@@ -267,6 +267,30 @@ def create_handler(app: Careflow):
                                                      data.get("reason", "")), 200
             if self.command == "GET" and len(segments) == 3 and segments[0] == "stock" and segments[2] == "history":
                 return app.supplies.lot_history(clinic_id, actor_id, segments[1]), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "stock" and segments[2] == "recall-notices":
+                data = self.body()
+                return app.recalls.import_notice(clinic_id, actor_id, segments[1], data.get("notice_ref", ""),
+                                                 data.get("revision", 0), data.get("urgency", ""), data.get("summary", ""),
+                                                 received_at=data.get("received_at")), 201
+            if self.command == "GET" and segments == ["recalls"]:
+                return {"items": app.recalls.list_recalls(clinic_id, actor_id)}, 200
+            if self.command == "GET" and len(segments) == 2 and segments[0] == "recalls":
+                return app.recalls.overview(clinic_id, actor_id, segments[1]), 200
+            if self.command == "GET" and len(segments) == 3 and segments[0] == "recalls" and segments[2] == "worklist":
+                return app.recalls.worklist(clinic_id, actor_id, segments[1]), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "recalls" and segments[2] == "close":
+                data = self.body()
+                return app.recalls.close_recall(clinic_id, actor_id, segments[1], data.get("expected_version", 0),
+                                                note=data.get("note", "")), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "recall-cases" and segments[2] in {"assign", "contact", "advance", "escalate", "review"}:
+                data = self.body()
+                return app.recalls.update_case(clinic_id, actor_id, segments[1], segments[2], data.get("expected_version", 0),
+                                               note=data.get("note"), assign_to=data.get("assign_to"),
+                                               contact_result=data.get("contact_result"),
+                                               next_review_on=data.get("next_review_on"),
+                                               to_stage=data.get("to_stage"), to_urgency=data.get("to_urgency")), 200
+            if self.command == "GET" and len(segments) == 3 and segments[0] == "recall-cases" and segments[2] == "history":
+                return app.recalls.case_history(clinic_id, actor_id, segments[1]), 200
             if self.command == "GET" and len(segments) == 3 and segments[0] == "appointments" and segments[2] == "encounter":
                 return app.encounter_for_appointment(clinic_id, actor_id, segments[1]), 200
             if self.command == "POST" and len(segments) == 3 and segments[0] == "encounters" and segments[2] == "notes":

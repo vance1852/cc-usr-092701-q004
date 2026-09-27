@@ -10,6 +10,7 @@ from . import audit
 from .db import Database, decode_json, encode_json
 from .errors import Conflict, NotFound, ValidationError
 from .ids import new_id, require_idempotency_key
+from .recalls import note_consumption_during_recall
 from .security import authorize, principal_for
 from .validation import calendar_date, choice, decimal_value, request_digest, text
 
@@ -247,6 +248,8 @@ class SupplyService:
                            f"reservation:{reservation_id}:consume", now)
             connection.execute("UPDATE stock_reservations SET state='consumed',updated_at=?,version=version+1 WHERE id=?",
                                (now, reservation_id))
+            note_consumption_during_recall(connection, clinic_id=clinic_id, reservation=row,
+                                           actor_id=actor_id, now=now)
             move = connection.execute("SELECT id FROM stock_movements WHERE idempotency_key=?", (f"reservation:{reservation_id}:consume",)).fetchone()
             audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=row["patient_id"],
                                aggregate_type="stock_reservation", aggregate_id=reservation_id, action="stock.consumed",

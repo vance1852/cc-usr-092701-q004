@@ -57,6 +57,239 @@ class CareflowCase(unittest.TestCase):
             self.clinic, self.coordinator, self.patient["id"], "复诊",
             "2026-09-29T10:00:00+08:00", "2026-09-29T10:30:00+08:00", key, staff_id=self.clinician)
 
+    def recall_product(self):
+        product = self.app.supplies.register_product(self.clinic, self.owner, "注射用透明质酸", "injectable", "支")
+        lot_a = self.app.supplies.receive_lot(self.clinic, self.owner, product["id"], "sup-9", "LOT-A", 5,
+                                              "recv-lot-a", expires_on="2027-01-01")
+        lot_b = self.app.supplies.receive_lot(self.clinic, self.owner, product["id"], "sup-9", "LOT-B", 6,
+                                              "recv-lot-b", expires_on="2027-06-01")
+        return product, lot_a, lot_b
+
+    def recall_patient(self, ref, name, phone=None):
+        return self.app.create_patient(self.clinic, self.coordinator, ref, name, phone_ciphertext=phone)["id"]
+
+    def reserve_for(self, patient_id, key, product_id, quantity, *, arrive=False):
+        appointment = self.app.create_appointment(self.clinic, self.coordinator, patient_id, "注射复诊",
+                                                  "2026-09-29T10:00:00+08:00", "2026-09-29T10:30:00+08:00", f"appt-{key}")
+        self.app.transition_appointment(self.clinic, self.coordinator, appointment["id"], 1, "book")
+        reserved = self.app.supplies.reserve(self.clinic, self.coordinator, appointment["id"],
+                                             product_id, quantity, f"reserve-{key}")
+        if arrive:
+            self.app.transition_appointment(self.clinic, self.coordinator, appointment["id"], 2, "arrive")
+        return appointment, reserved
+
+    def consume_reserved(self, reserved):
+        return [self.app.supplies.consume_reservation(self.clinic, self.clinician, item["id"], expected_version=1)
+                for item in reserved["reservations"]]
+
+    def test_recall_snapshot_covers_consumed_and_reserved_but_not_other_lots(self):
+        product, lot_a, lot_b = self.recall_product()
+        patient_a = self.recall_patient("recall-a", "患者甲")
+        patient_b = self.recall_patient("recall-b", "患者乙")
+        patient_c = self.recall_patient("recall-c", "患者丙")
+        _, reserved_a = self.reserve_for(patient_a, "a", product["id"], 2, arrive=True)
+        self.consume_reserved(reserved_a)
+        _, reserved_b = self.reserve_for(patient_b, "b", product["id"], 3)
+        _, reserved_c = self.reserve_for(patient_c, "c", product["id"], 2, arrive=True)
+        self.assertEqual(reserved_c["reservations"][0]["lot_id"], lot_b["id"])
+        self.consume_reserved(reserved_c)
+
+        result = self.app.recalls.import_notice(self.clinic, self.owner, lot_a["id"], "NOTICE-2026-01", 1,
+                                                "high", "供应商报告批次可能污染")
+        self.assertEqual(result["cases_created"], 2)
+        self.assertFalse(result["replayed"])
+        recall_id = result["recall_id"]
+
+        overview = self.app.recalls.overview(self.clinic, self.owner, recall_id)
+        self.assertEqual(overview["lot"]["quantity_received"], 5)
+        self.assertEqual(overview["totals"]["cases"], 2)
+        self.assertEqual(overview["totals"]["patients_pending"], 2)
+        self.assertEqual(overview["totals"]["by_stage"], {"pending": 2})
+        by_patient = {case["patient_id"]: case for case in overview["cases"]}
+        self.assertEqual(set(by_patient), {patient_a, patient_b})
+        self.assertEqual(by_patient[patient_a]["items"][0]["reservation_state"], "consumed")
+        self.assertEqual(by_patient[patient_b]["items"][0]["reservation_state"], "reserved")
+        self.assertEqual(by_patient[patient_a]["last_event"]["event_type"], "snapshot")
+        self.assertEqual(by_patient[patient_a]["assigned_to"], self.owner)
+        listed = {item["reservation_id"] for case in overview["cases"] for item in case["items"]}
+        self.assertNotIn(reserved_c["reservations"][0]["id"], listed)
+        self.assertEqual(len(self.app.recalls.list_recalls(self.clinic, self.owner)), 1)
+        # 召回活动不改变批次库存状态；既有接口仍可把批次设为召回。
+        self.assertEqual(self.app.supplies.lot_balances(self.clinic, product["id"])[0]["state"], "available")
+        self.app.supplies.change_lot_state(self.clinic, self.owner, lot_a["id"], "recall", "供应商通知召回")
+        self.assertEqual(self.app.recalls.overview(self.clinic, self.owner, recall_id)["lot"]["state"], "recalled")
+
+    def test_recall_notice_reimport_and_revision_preserve_completed_cases(self):
+        product, lot_a, _ = self.recall_product()
+        patient_a = self.recall_patient("recall-a", "患者甲")
+        _, reserved_a = self.reserve_for(patient_a, "a", product["id"], 2, arrive=True)
+        self.consume_reserved(reserved_a)
+        first = self.app.recalls.import_notice(self.clinic, self.owner, lot_a["id"], "NOTICE-1", 1,
+                                               "routine", "批次质量通知")
+        recall_id = first["recall_id"]
+        case = self.app.recalls.overview(self.clinic, self.owner, recall_id)["cases"][0]
+        contacted = self.app.recalls.update_case(self.clinic, self.nurse, case["id"], "contact", 1,
+                                                 contact_result="reached", next_review_on="2026-10-01")
+        self.assertEqual(contacted["stage"], "contacted")
+        self.app.recalls.update_case(self.clinic, self.clinician, case["id"], "advance", 2,
+                                     to_stage="resolved", note="患者无不良反应")
+        closed = self.app.recalls.update_case(self.clinic, self.clinician, case["id"], "advance", 3,
+                                              to_stage="closed", note="复核完成")
+        self.assertEqual(closed["stage"], "closed")
+
+        replay = self.app.recalls.import_notice(self.clinic, self.owner, lot_a["id"], "NOTICE-1", 1,
+                                                "routine", "批次质量通知")
+        self.assertTrue(replay["replayed"])
+        revised = self.app.recalls.import_notice(self.clinic, self.owner, lot_a["id"], "NOTICE-1", 2,
+                                                 "urgent", "供应商修订：提高风险等级")
+        self.assertFalse(revised["replayed"])
+        overview = self.app.recalls.overview(self.clinic, self.owner, recall_id)
+        self.assertEqual(overview["recall"]["urgency"], "urgent")
+        self.assertEqual(len(overview["notices"]), 2)
+        self.assertEqual(overview["totals"]["cases"], 1)
+        self.assertEqual(overview["cases"][0]["stage"], "closed")
+        with self.assertRaises(Conflict):
+            self.app.recalls.import_notice(self.clinic, self.owner, lot_a["id"], "NOTICE-1", 2,
+                                           "high", "内容不一致的重复版本")
+        with self.assertRaises(Conflict):
+            self.app.recalls.import_notice(self.clinic, self.owner, lot_a["id"], "NOTICE-2", 1,
+                                           "high", "更早版本号的通知")
+
+    def test_consumption_during_open_recall_enters_manual_review(self):
+        product, lot_a, _ = self.recall_product()
+        patient_a = self.recall_patient("recall-a", "患者甲")
+        _, reserved_a = self.reserve_for(patient_a, "a", product["id"], 2, arrive=True)
+        result = self.app.recalls.import_notice(self.clinic, self.owner, lot_a["id"], "NOTICE-1", 1,
+                                                "high", "批次质量通知")
+        recall_id = result["recall_id"]
+        case_id = self.app.recalls.overview(self.clinic, self.owner, recall_id)["cases"][0]["id"]
+
+        self.consume_reserved(reserved_a)
+        overview = self.app.recalls.overview(self.clinic, self.owner, recall_id)
+        self.assertEqual(overview["totals"]["cases"], 1)
+        self.assertEqual(overview["totals"]["review_required"], 1)
+        case = overview["cases"][0]
+        self.assertTrue(case["review_required"])
+        self.assertEqual(case["items"][0]["reservation_state"], "consumed")
+        self.assertEqual(case["last_event"]["event_type"], "consumed_during_recall")
+
+        self.app.recalls.update_case(self.clinic, self.nurse, case_id, "contact", 2, contact_result="reached")
+        with self.assertRaises(Conflict):
+            self.app.recalls.update_case(self.clinic, self.clinician, case_id, "advance", 3,
+                                         to_stage="resolved", note="未复核就试图完成")
+        with self.assertRaises(Forbidden):
+            self.app.recalls.update_case(self.clinic, self.coordinator, case_id, "review", 3, note="越权复核")
+        reviewed = self.app.recalls.update_case(self.clinic, self.clinician, case_id, "review", 3,
+                                                note="已核对批号与用量")
+        self.assertFalse(reviewed["review_required"])
+        resolved = self.app.recalls.update_case(self.clinic, self.clinician, case_id, "advance", 4,
+                                                to_stage="resolved", note="复核后完成处置")
+        self.assertEqual(resolved["stage"], "resolved")
+
+        patient_b = self.recall_patient("recall-b", "患者乙")
+        _, reserved_b = self.reserve_for(patient_b, "b", product["id"], 1, arrive=True)
+        self.consume_reserved(reserved_b)
+        overview = self.app.recalls.overview(self.clinic, self.owner, recall_id)
+        self.assertEqual(overview["totals"]["cases"], 2)
+        late_case = next(case for case in overview["cases"] if case["patient_id"] == patient_b)
+        self.assertTrue(late_case["review_required"])
+        self.assertEqual(late_case["stage"], "pending")
+
+    def test_case_escalation_keeps_basis_and_worklist_is_minimized(self):
+        product, lot_a, _ = self.recall_product()
+        patient_a = self.recall_patient("recall-a", "患者甲", phone="cipher://contact-0102")
+        _, reserved_a = self.reserve_for(patient_a, "a", product["id"], 2, arrive=True)
+        self.consume_reserved(reserved_a)
+        result = self.app.recalls.import_notice(self.clinic, self.owner, lot_a["id"], "NOTICE-1", 1,
+                                                "routine", "批次质量通知")
+        recall_id = result["recall_id"]
+        case_id = self.app.recalls.overview(self.clinic, self.owner, recall_id)["cases"][0]["id"]
+
+        with self.assertRaises(ValidationError):
+            self.app.recalls.update_case(self.clinic, self.clinician, case_id, "escalate", 1, to_urgency="high")
+        with self.assertRaises(Forbidden):
+            self.app.recalls.update_case(self.clinic, self.coordinator, case_id, "escalate", 1,
+                                         to_urgency="high", note="排班人员越权升级")
+        escalated = self.app.recalls.update_case(self.clinic, self.clinician, case_id, "escalate", 1,
+                                                 to_urgency="high", note="患者报告注射部位红肿")
+        self.assertEqual(escalated["urgency"], "high")
+        with self.assertRaises(Conflict):
+            self.app.recalls.update_case(self.clinic, self.clinician, case_id, "escalate", 2,
+                                         to_urgency="routine", note="试图降级")
+        history = self.app.recalls.case_history(self.clinic, self.owner, case_id)
+        escalation = next(event for event in history["events"] if event["event_type"] == "escalated")
+        self.assertEqual(escalation["note"], "患者报告注射部位红肿")
+        self.assertEqual((escalation["from_urgency"], escalation["to_urgency"]), ("routine", "high"))
+
+        with self.assertRaises(ValidationError):
+            self.app.recalls.update_case(self.clinic, self.coordinator, case_id, "contact", 2,
+                                         contact_result="callback_requested")
+        contacted = self.app.recalls.update_case(self.clinic, self.coordinator, case_id, "contact", 2,
+                                                 contact_result="callback_requested", next_review_on="2026-09-30")
+        self.assertEqual(contacted["stage"], "contacted")
+        self.assertEqual(contacted["next_review_on"], "2026-09-30")
+
+        worklist = self.app.recalls.worklist(self.clinic, self.coordinator, recall_id)
+        self.assertEqual(len(worklist["items"]), 1)
+        item = worklist["items"][0]
+        self.assertEqual(item["phone_ciphertext"], "cipher://contact-0102")
+        self.assertEqual(item["product_name"], "注射用透明质酸")
+        self.assertEqual(item["stage"], "contacted")
+        self.assertNotIn("review_required", item)
+        self.assertNotIn("quantity_received", json.dumps(worklist, ensure_ascii=False))
+        self.assertNotIn("supplier_ref", json.dumps(worklist, ensure_ascii=False))
+        auditor = self.app.create_staff(self.clinic, "审计人员", "auditor", actor_id=self.owner)["id"]
+        with self.assertRaises(Forbidden):
+            self.app.recalls.worklist(self.clinic, auditor, recall_id)
+        with self.assertRaises(Forbidden):
+            self.app.recalls.overview(self.clinic, self.coordinator, recall_id)
+
+    def test_observing_stage_requires_review_date(self):
+        product, lot_a, _ = self.recall_product()
+        patient_a = self.recall_patient("recall-a", "患者甲")
+        _, reserved_a = self.reserve_for(patient_a, "a", product["id"], 2, arrive=True)
+        self.consume_reserved(reserved_a)
+        result = self.app.recalls.import_notice(self.clinic, self.owner, lot_a["id"], "NOTICE-1", 1,
+                                                "routine", "批次质量通知")
+        case_id = self.app.recalls.overview(self.clinic, self.owner, result["recall_id"])["cases"][0]["id"]
+        self.app.recalls.update_case(self.clinic, self.nurse, case_id, "contact", 1, contact_result="reached")
+        with self.assertRaises(ValidationError):
+            self.app.recalls.update_case(self.clinic, self.clinician, case_id, "advance", 2,
+                                         to_stage="observing", note="转入观察")
+        advanced = self.app.recalls.update_case(self.clinic, self.clinician, case_id, "advance", 2,
+                                                to_stage="observing", note="转入观察", next_review_on="2026-10-05")
+        self.assertEqual(advanced["next_review_on"], "2026-10-05")
+        with self.assertRaises(Conflict):
+            self.app.recalls.update_case(self.clinic, self.clinician, case_id, "advance", 3,
+                                         to_stage="contacted", note="试图回退阶段")
+
+    def test_recall_close_requires_all_cases_closed(self):
+        product, lot_a, _ = self.recall_product()
+        patient_a = self.recall_patient("recall-a", "患者甲")
+        patient_b = self.recall_patient("recall-b", "患者乙")
+        _, reserved_a = self.reserve_for(patient_a, "a", product["id"], 2, arrive=True)
+        self.consume_reserved(reserved_a)
+        self.reserve_for(patient_b, "b", product["id"], 3)
+        result = self.app.recalls.import_notice(self.clinic, self.owner, lot_a["id"], "NOTICE-1", 1,
+                                                "high", "批次质量通知")
+        recall_id = result["recall_id"]
+        with self.assertRaises(Conflict):
+            self.app.recalls.close_recall(self.clinic, self.owner, recall_id, 1, note="尚有病例未处置")
+        for case in self.app.recalls.overview(self.clinic, self.owner, recall_id)["cases"]:
+            self.app.recalls.update_case(self.clinic, self.nurse, case["id"], "contact", 1, contact_result="reached")
+            self.app.recalls.update_case(self.clinic, self.clinician, case["id"], "advance", 2,
+                                         to_stage="resolved", note="已完成随访")
+            self.app.recalls.update_case(self.clinic, self.clinician, case["id"], "advance", 3,
+                                         to_stage="closed", note="关闭病例")
+        closed = self.app.recalls.close_recall(self.clinic, self.owner, recall_id, 1, note="全部病例处置完成")
+        self.assertEqual(closed["state"], "closed")
+        case_id = self.app.recalls.overview(self.clinic, self.owner, recall_id)["cases"][0]["id"]
+        with self.assertRaises(Conflict):
+            self.app.recalls.update_case(self.clinic, self.clinician, case_id, "assign", 4, assign_to=self.nurse)
+        with self.assertRaises(Conflict):
+            self.app.recalls.import_notice(self.clinic, self.owner, lot_a["id"], "NOTICE-1", 2,
+                                           "urgent", "迟到的供应商修订")
+
     def test_initialization_is_atomic_and_password_change_revokes_sessions(self):
         self.assertEqual(self.app.login(self.clinic, self.owner, "LongPassphrase!2026")["role"], "owner")
         token = self.app.login(self.clinic, self.owner, "LongPassphrase!2026")["access_token"]

@@ -11,7 +11,7 @@ from typing import Iterator
 
 from .errors import StorageFailure
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -247,6 +247,76 @@ CREATE TABLE IF NOT EXISTS lot_alerts (
     UNIQUE(lot_id,id)
 );
 CREATE INDEX IF NOT EXISTS lot_alerts_recent ON lot_alerts(lot_id,created_at DESC);
+CREATE TABLE IF NOT EXISTS recalls (
+    id TEXT PRIMARY KEY,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    lot_id TEXT NOT NULL REFERENCES product_lots(id),
+    state TEXT NOT NULL CHECK(state IN ('open','closed')),
+    urgency TEXT NOT NULL CHECK(urgency IN ('routine','high','urgent')),
+    summary TEXT NOT NULL,
+    opened_by TEXT NOT NULL REFERENCES staff(id),
+    opened_at TEXT NOT NULL,
+    closed_at TEXT,
+    created_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(clinic_id,lot_id)
+);
+CREATE TABLE IF NOT EXISTS recall_notices (
+    id TEXT PRIMARY KEY,
+    recall_id TEXT NOT NULL REFERENCES recalls(id),
+    notice_ref TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision>=1),
+    urgency TEXT NOT NULL CHECK(urgency IN ('routine','high','urgent')),
+    summary TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    recorded_by TEXT NOT NULL REFERENCES staff(id),
+    received_at TEXT NOT NULL,
+    supersedes TEXT REFERENCES recall_notices(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(recall_id,notice_ref,revision)
+);
+CREATE INDEX IF NOT EXISTS recall_notices_revision ON recall_notices(recall_id,revision DESC);
+CREATE TABLE IF NOT EXISTS recall_cases (
+    id TEXT PRIMARY KEY,
+    recall_id TEXT NOT NULL REFERENCES recalls(id),
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    patient_id TEXT NOT NULL REFERENCES patients(id),
+    stage TEXT NOT NULL CHECK(stage IN ('pending','contacted','observing','resolved','closed')),
+    urgency TEXT NOT NULL CHECK(urgency IN ('routine','high','urgent')),
+    assigned_to TEXT REFERENCES staff(id),
+    contact_result TEXT CHECK(contact_result IN ('reached','unreachable','refused','callback_requested')),
+    next_review_on TEXT,
+    review_required INTEGER NOT NULL DEFAULT 0 CHECK(review_required IN (0,1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(recall_id,patient_id)
+);
+CREATE INDEX IF NOT EXISTS recall_cases_stage ON recall_cases(recall_id,stage);
+CREATE TABLE IF NOT EXISTS recall_case_items (
+    id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL REFERENCES recall_cases(id),
+    reservation_id TEXT NOT NULL REFERENCES stock_reservations(id),
+    appointment_id TEXT NOT NULL REFERENCES appointments(id),
+    quantity REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(case_id,reservation_id),
+    UNIQUE(reservation_id)
+);
+CREATE TABLE IF NOT EXISTS recall_case_events (
+    id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL REFERENCES recall_cases(id),
+    sequence INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    actor_id TEXT REFERENCES staff(id),
+    note TEXT NOT NULL,
+    from_stage TEXT,
+    to_stage TEXT,
+    from_urgency TEXT,
+    to_urgency TEXT,
+    occurred_at TEXT NOT NULL,
+    UNIQUE(case_id,sequence)
+);
 CREATE TABLE IF NOT EXISTS encounters (
     id TEXT PRIMARY KEY,
     appointment_id TEXT NOT NULL UNIQUE REFERENCES appointments(id),
