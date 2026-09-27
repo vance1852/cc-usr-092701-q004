@@ -247,6 +247,73 @@ CREATE TABLE IF NOT EXISTS lot_alerts (
     UNIQUE(lot_id,id)
 );
 CREATE INDEX IF NOT EXISTS lot_alerts_recent ON lot_alerts(lot_id,created_at DESC);
+CREATE TABLE IF NOT EXISTS lot_recalls (
+    id TEXT PRIMARY KEY,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    lot_id TEXT NOT NULL REFERENCES product_lots(id),
+    notice_ref TEXT NOT NULL,
+    supplier_ref TEXT NOT NULL,
+    notice_at TEXT NOT NULL,
+    urgency TEXT NOT NULL CHECK(urgency IN ('low','moderate','high','urgent')),
+    state TEXT NOT NULL CHECK(state IN ('open','closed')),
+    summary TEXT NOT NULL,
+    guidance TEXT,
+    request_hash TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES staff(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(lot_id,notice_ref)
+);
+CREATE INDEX IF NOT EXISTS lot_recalls_clinic ON lot_recalls(clinic_id,state,created_at);
+CREATE TABLE IF NOT EXISTS lot_recall_revisions (
+    id TEXT PRIMARY KEY,
+    recall_id TEXT NOT NULL REFERENCES lot_recalls(id),
+    revision_ref TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    summary TEXT,
+    guidance TEXT,
+    created_by TEXT NOT NULL REFERENCES staff(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(recall_id,revision_ref)
+);
+CREATE TABLE IF NOT EXISTS lot_recall_cases (
+    id TEXT PRIMARY KEY,
+    recall_id TEXT NOT NULL REFERENCES lot_recalls(id),
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    lot_id TEXT NOT NULL REFERENCES product_lots(id),
+    reservation_id TEXT NOT NULL REFERENCES stock_reservations(id),
+    appointment_id TEXT NOT NULL REFERENCES appointments(id),
+    patient_id TEXT NOT NULL REFERENCES patients(id),
+    exposure_state TEXT NOT NULL CHECK(exposure_state IN ('reserved','consumed')),
+    snapshot_json TEXT NOT NULL,
+    stage TEXT NOT NULL CHECK(stage IN ('identified','contacted','completed')),
+    requires_manual_review INTEGER NOT NULL DEFAULT 0 CHECK(requires_manual_review IN (0,1)),
+    owner_id TEXT REFERENCES staff(id),
+    contact_state TEXT NOT NULL CHECK(contact_state IN ('pending','reached','unreachable','declined','no_contact_required')),
+    contact_result TEXT,
+    last_contact_at TEXT,
+    next_review_on TEXT,
+    created_by TEXT NOT NULL REFERENCES staff(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(recall_id,reservation_id)
+);
+CREATE INDEX IF NOT EXISTS recall_cases_work ON lot_recall_cases(recall_id,stage,requires_manual_review,next_review_on);
+CREATE INDEX IF NOT EXISTS recall_cases_patient ON lot_recall_cases(patient_id,stage);
+CREATE TABLE IF NOT EXISTS lot_recall_events (
+    id TEXT PRIMARY KEY,
+    recall_id TEXT NOT NULL REFERENCES lot_recalls(id),
+    sequence INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    actor_id TEXT REFERENCES staff(id),
+    note TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(recall_id,sequence)
+);
+CREATE INDEX IF NOT EXISTS recall_events_recall ON lot_recall_events(recall_id,sequence);
 CREATE TABLE IF NOT EXISTS encounters (
     id TEXT PRIMARY KEY,
     appointment_id TEXT NOT NULL UNIQUE REFERENCES appointments(id),

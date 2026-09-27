@@ -50,6 +50,7 @@ class ConsistencyChecker:
         self.check_incident_ledger()
         self.check_signed_records()
         self.check_duplicate_active_reservations()
+        self.check_recall_cases()
         chain = audit.verify_chain(self.connection, self.clinic_id)
         if not chain["ok"]:
             self.add("audit.chain_mismatch", "critical", "clinic", self.clinic_id,
@@ -219,6 +220,27 @@ class ConsistencyChecker:
                      {"appointments": [row["first_id"], row["second_id"]],
                       "intervals": [[row["starts_at"], row["first_end"]], [row["second_start"], row["second_end"]]]},
                      "联系诊所排班负责人核对是否为合法协同服务或重复占用。")
+
+    def check_recall_cases(self) -> None:
+        from zoneinfo import ZoneInfo
+
+        clinic = self.connection.execute("SELECT timezone FROM clinics WHERE id=?", (self.clinic_id,)).fetchone()
+        local_today = (datetime.fromisoformat(self.as_of.replace("Z", "+00:00"))
+                       .astimezone(ZoneInfo(clinic["timezone"])).date().isoformat()) if clinic else self.as_of[:10]
+        rows = self.connection.execute(
+            "SELECT c.id,c.recall_id,c.patient_id,c.stage,c.requires_manual_review,c.next_review_on,c.contact_state "
+            "FROM lot_recall_cases c JOIN lot_recalls r ON r.id=c.recall_id WHERE c.clinic_id=? AND r.state='open'",
+            (self.clinic_id,)).fetchall()
+        for row in rows:
+            if row["requires_manual_review"]:
+                self.add("recall.consumption_manual_review", "high", "lot_recall_case", row["id"],
+                         {"recall_id": row["recall_id"], "patient_id": row["patient_id"], "stage": row["stage"]},
+                         "召回期间完成核销的病例必须由临床岗位人工复核并记录结论，不得直接关闭。")
+            elif row["stage"] != "completed" and row["next_review_on"] and row["next_review_on"] < local_today:
+                self.add("recall.review_overdue", "medium", "lot_recall_case", row["id"],
+                         {"recall_id": row["recall_id"], "patient_id": row["patient_id"],
+                          "next_review_on": row["next_review_on"], "contact_state": row["contact_state"]},
+                         "后续复核日期已过；责任人应补做复核并登记联系结果。")
 
 
 def clinic_diagnostics(connection, clinic_id: str, as_of: str) -> dict[str, Any]:

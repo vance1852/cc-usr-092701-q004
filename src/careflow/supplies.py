@@ -212,7 +212,10 @@ class SupplyService:
         return {"id": reservation_id, "state": "released", "quantity": row["quantity"], "version": expected_version + 1}
 
     def consume_reservation(self, clinic_id: str, actor_id: str, reservation_id: str,
-                            *, expected_version: int, witnessed_by: str | None = None) -> dict[str, Any]:
+                            *, expected_version: int, witnessed_by: str | None = None,
+                            recall_acknowledgement: str | None = None) -> dict[str, Any]:
+        if recall_acknowledgement is not None:
+            recall_acknowledgement = text(recall_acknowledgement, "召回批号使用确认", minimum=5, maximum=1000)
         now = self.now()
         with self.db.transaction() as connection:
             principal = principal_for(connection, actor_id, clinic_id)
@@ -233,8 +236,16 @@ class SupplyService:
                         "quantity": row["quantity"], "replayed": True}
             if row["state"] != "reserved" or row["appointment_state"] not in {"arrived", "in_service"}:
                 raise Conflict("只有已到诊且仍有效的耗材预留可以核销")
-            if row["lot_state"] != "available" or (row["expires_on"] and row["expires_on"] < self.local_date(connection, clinic_id)):
+            local_today = self.local_date(connection, clinic_id)
+            expired = bool(row["expires_on"] and row["expires_on"] < local_today)
+            if row["lot_state"] != "available" and not (row["lot_state"] == "recalled" and recall_acknowledgement):
                 raise Conflict("耗材批次已隔离、召回或过期")
+            if expired:
+                raise Conflict("耗材批次已过期")
+            if recall_acknowledgement and row["lot_state"] != "recalled":
+                raise Conflict("只有召回批号核销时才能填写召回确认")
+            if recall_acknowledgement and principal.role not in {"clinician", "owner"}:
+                raise Conflict("召回批号的使用确认只能由临床岗位或负责人作出")
             if row["requires_clinician"] and principal.role not in {"clinician", "owner"}:
                 raise Conflict("此类耗材只能由临床岗位核销")
             if witnessed_by and witnessed_by != actor_id:
@@ -242,8 +253,9 @@ class SupplyService:
                 if witness is None or not witness["active"] or witness["role"] not in {"clinician", "nurse", "owner"}:
                     raise ValidationError("见证人必须是有效临床岗位")
             movement_id = new_id("mov")
+            reason = "患者使用" + (f"；召回批号临床确认：{recall_acknowledgement}" if recall_acknowledgement else "") + f"；见证人={witnessed_by or '无'}"
             self._movement(connection, row["lot_id"], "consumed", 0, row["appointment_id"],
-                           row["patient_id"], actor_id, f"患者使用；见证人={witnessed_by or '无'}",
+                           row["patient_id"], actor_id, reason,
                            f"reservation:{reservation_id}:consume", now)
             connection.execute("UPDATE stock_reservations SET state='consumed',updated_at=?,version=version+1 WHERE id=?",
                                (now, reservation_id))
@@ -251,9 +263,20 @@ class SupplyService:
             audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=row["patient_id"],
                                aggregate_type="stock_reservation", aggregate_id=reservation_id, action="stock.consumed",
                                occurred_at=now, payload={"lot_id": row["lot_id"], "quantity": row["quantity"],
-                                                         "witnessed_by": witnessed_by})
-        return {"id": reservation_id, "state": "consumed", "movement_id": move[0],
-                "quantity": row["quantity"], "replayed": False}
+                                                         "witnessed_by": witnessed_by,
+                                                         "recall_acknowledgement": recall_acknowledgement})
+            recall_flagged = False
+            if recall_acknowledgement:
+                from .recalls import RecallService
+
+                recall_flagged = RecallService(self.db, self.clock).flag_consumption_after_consume(
+                    connection, clinic_id=clinic_id, lot_id=row["lot_id"], reservation=row,
+                    actor_id=actor_id, now=now, acknowledgement=recall_acknowledgement)
+        result = {"id": reservation_id, "state": "consumed", "movement_id": move[0],
+                  "quantity": row["quantity"], "replayed": False}
+        if recall_flagged:
+            result["recall_manual_review"] = True
+        return result
 
     def change_lot_state(self, clinic_id: str, actor_id: str, lot_id: str,
                          action: str, reason: str) -> dict[str, Any]:

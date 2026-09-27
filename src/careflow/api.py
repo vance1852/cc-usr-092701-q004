@@ -257,7 +257,8 @@ def create_handler(app: Careflow):
                 if segments[2] == "consume":
                     return app.supplies.consume_reservation(clinic_id, actor_id, segments[1],
                                                             expected_version=data.get("expected_version", 0),
-                                                            witnessed_by=data.get("witnessed_by")), 200
+                                                            witnessed_by=data.get("witnessed_by"),
+                                                            recall_acknowledgement=data.get("recall_acknowledgement")), 200
                 return app.supplies.release_reservation(clinic_id, actor_id, segments[1], data.get("reason", ""),
                                                         data.get("expected_version", 0)), 200
             if self.command == "POST" and len(segments) == 3 and segments[0] == "stock" and segments[2] in {"quarantine", "recall", "release-quarantine"}:
@@ -267,6 +268,48 @@ def create_handler(app: Careflow):
                                                      data.get("reason", "")), 200
             if self.command == "GET" and len(segments) == 3 and segments[0] == "stock" and segments[2] == "history":
                 return app.supplies.lot_history(clinic_id, actor_id, segments[1]), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "stock" and segments[2] == "recalls":
+                data = self.body()
+                return app.recalls.open_recall(clinic_id, actor_id, segments[1], data.get("supplier_ref", ""),
+                                               data.get("notice_ref", ""), data.get("notice_at", ""),
+                                               data.get("urgency", ""), data.get("summary", ""),
+                                               self.headers.get("Idempotency-Key", ""),
+                                               guidance=data.get("guidance")), 201
+            if self.command == "GET" and len(segments) == 3 and segments[0] == "stock" and segments[2] == "recalls":
+                return app.recalls.list_for_lot(clinic_id, actor_id, segments[1]), 200
+            if self.command == "GET" and len(segments) == 3 and segments[0] == "recalls" and segments[2] == "contact-queue":
+                return app.recalls.contact_queue(clinic_id, actor_id, segments[1]), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "recalls" and segments[2] == "revisions":
+                data = self.body()
+                return app.recalls.revise_recall(clinic_id, actor_id, segments[1], data.get("revision_ref", ""),
+                                                 self.headers.get("Idempotency-Key", ""), data.get("note", ""),
+                                                 summary=data.get("summary"), guidance=data.get("guidance"),
+                                                 urgency=data.get("urgency")), 201
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "recalls" and segments[2] == "escalate":
+                data = self.body()
+                return app.recalls.escalate_urgency(clinic_id, actor_id, segments[1], data.get("urgency", ""),
+                                                    data.get("basis", ""), data.get("expected_version", 0)), 200
+            if self.command == "GET" and len(segments) == 2 and segments[0] == "recalls":
+                return app.recalls.recall_detail(clinic_id, actor_id, segments[1]), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "recall-cases" and segments[2] == "assign":
+                data = self.body()
+                return app.recalls.assign_case(clinic_id, actor_id, segments[1], data.get("owner_id", "")), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "recall-cases" and segments[2] == "contact":
+                data = self.body()
+                return app.recalls.record_contact(clinic_id, actor_id, segments[1], data.get("contact_state", ""),
+                                                  data.get("expected_version", 0), result=data.get("result"),
+                                                  next_review_on=data.get("next_review_on")), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "recall-cases" and segments[2] == "manual-review":
+                data = self.body()
+                return app.recalls.resolve_manual_review(clinic_id, actor_id, segments[1], data.get("note", ""),
+                                                         data.get("expected_version", 0),
+                                                         next_review_on=data.get("next_review_on")), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "recall-cases" and segments[2] == "complete":
+                data = self.body()
+                return app.recalls.complete_case(clinic_id, actor_id, segments[1], data.get("note", ""),
+                                                 data.get("expected_version", 0),
+                                                 no_contact_required=data.get("no_contact_required", False),
+                                                 next_review_on=data.get("next_review_on")), 200
             if self.command == "GET" and len(segments) == 3 and segments[0] == "appointments" and segments[2] == "encounter":
                 return app.encounter_for_appointment(clinic_id, actor_id, segments[1]), 200
             if self.command == "POST" and len(segments) == 3 and segments[0] == "encounters" and segments[2] == "notes":
